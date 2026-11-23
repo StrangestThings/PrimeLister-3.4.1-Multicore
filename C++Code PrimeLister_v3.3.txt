@@ -1,0 +1,962 @@
+// PrimeLister 3.3
+// Original modulo-6 mapping and all three generating formulas strictly retained:
+//   1) candidate(i) = 3 * i + ((i & 1) ? 4 : 5)
+//   2) Progression 1: start = (p * p) / 3 - 1,       step = 2 * p
+//   3) Progression 2: start = (p * other) / 3 - 1,   step = 2 * p
+//      with other = p + (p % 6 == 5 ? 2 : 4)
+// Accelerated via:
+//   - 32 KiB L1-resident segments
+//   - 16-pattern tiled AVX2 presieving up to prime 163 (built directly from formulas 2 & 3)
+//   - Switch-free 8-lane stride-p unrolled marking for small primes (167..2048)
+//   - Switch-free flat 64-bit word marking for medium primes (2049..131071)
+//   - Bucket sieving for large primes (>= 131072)
+//   - Hardware POPCNT (4x unrolled)
+//   - 64-byte aligned zero-init chunks + L1 staging buffer with AVX2 non-temporal
+//     stores (_mm256_stream_si256) to halve DRAM write-allocate traffic
+// C++17, MSVC x64 or GCC/Clang. OpenMP optional.
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <charconv>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <exception>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <limits>
+#include <memory>
+#include <new>
+#include <stdexcept>
+#include <string>
+#include <system_error>
+#include <vector>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+#ifdef _MSC_VER
+#include <intrin.h>
+#endif
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
+
+namespace primelister {
+    using u8 = std::uint8_t;
+    using u16 = std::uint16_t;
+    using u32 = std::uint32_t;
+    using u64 = std::uint64_t;
+    using Clock = std::chrono::steady_clock;
+
+    constexpr u32 SEG_BYTE_SHIFT = 15;
+    constexpr u32 SEG_BYTES = 1u << SEG_BYTE_SHIFT; // 32 KiB L1-resident sieve buffer
+    constexpr u32 SEG_BITS = SEG_BYTES * 8u;       // 262,144 Mod-6 indices (= 786,432 integers)
+    constexpr u32 SEG_BIT_SHIFT = SEG_BYTE_SHIFT + 3u;  // 18
+    constexpr u32 SEG_BIT_MASK = SEG_BITS - 1u;
+    constexpr u32 PRESIEVE_TILE = 2048u;                // 2 KiB tile keeps all 16 patterns hot in L2
+    constexpr u32 LANE_P_LIMIT = 2048u;                // 167..2048: 8-lane stride-p 4x unrolled
+    constexpr u32 BUCKET_LIMIT = SEG_BITS / 2u;        // 131,072: switch to bucket sieve
+    constexpr std::size_t NT_STAGE_FLUSH = 512u;         // 4 KiB L1 staging buffer (multiple of 4 u64)
+
+    inline double seconds(Clock::time_point t) {
+        return std::chrono::duration<double>(Clock::now() - t).count();
+    }
+
+    inline int available_threads() {
+#ifdef _OPENMP
+        return std::max(1, omp_get_max_threads());
+#else
+        return 1;
+#endif
+    }
+
+    inline unsigned trailing_zeros(u64 x) { // caller guarantees x != 0
+#ifdef _MSC_VER
+        unsigned long i;
+        _BitScanForward64(&i, x);
+        return static_cast<unsigned>(i);
+#else
+        return static_cast<unsigned>(__builtin_ctzll(x));
+#endif
+    }
+
+    inline unsigned popcount_swar(u64 x) {
+        x -= (x >> 1) & 0x5555555555555555ULL;
+        x = (x & 0x3333333333333333ULL) + ((x >> 2) & 0x3333333333333333ULL);
+        return static_cast<unsigned>(((x + (x >> 4)) & 0x0f0f0f0f0f0f0f0fULL)
+            * 0x0101010101010101ULL >> 56);
+    }
+
+    inline u64 count_words_swar(const u64* words, u32 wc) {
+        u64 c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+        u32 i = 0;
+        for (; i + 3 < wc; i += 4) {
+            c0 += popcount_swar(~words[i]);
+            c1 += popcount_swar(~words[i + 1]);
+            c2 += popcount_swar(~words[i + 2]);
+            c3 += popcount_swar(~words[i + 3]);
+        }
+        u64 sum = c0 + c1 + c2 + c3;
+        for (; i < wc; ++i) sum += popcount_swar(~words[i]);
+        return sum;
+    }
+
+#if defined(__POPCNT__)
+    inline u64 count_words(const u64* words, u32 wc) {
+        u64 c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+        u32 i = 0;
+        for (; i + 3 < wc; i += 4) {
+            c0 += static_cast<u64>(__builtin_popcountll(~words[i]));
+            c1 += static_cast<u64>(__builtin_popcountll(~words[i + 1]));
+            c2 += static_cast<u64>(__builtin_popcountll(~words[i + 2]));
+            c3 += static_cast<u64>(__builtin_popcountll(~words[i + 3]));
+        }
+        u64 sum = c0 + c1 + c2 + c3;
+        for (; i < wc; ++i) sum += static_cast<u64>(__builtin_popcountll(~words[i]));
+        return sum;
+    }
+#elif defined(_MSC_VER) && defined(_M_X64)
+    inline bool cpu_has_popcnt() {
+        static const bool supported = []() {
+            int regs[4] = {};
+            __cpuid(regs, 1);
+            return (regs[2] & (1 << 23)) != 0;
+            }();
+        return supported;
+    }
+    inline u64 count_words(const u64* words, u32 wc) {
+        if (!cpu_has_popcnt()) return count_words_swar(words, wc);
+        u64 c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+        u32 i = 0;
+        for (; i + 3 < wc; i += 4) {
+            c0 += __popcnt64(~words[i]);
+            c1 += __popcnt64(~words[i + 1]);
+            c2 += __popcnt64(~words[i + 2]);
+            c3 += __popcnt64(~words[i + 3]);
+        }
+        u64 sum = c0 + c1 + c2 + c3;
+        for (; i < wc; ++i) sum += __popcnt64(~words[i]);
+        return sum;
+    }
+#elif (defined(__GNUC__) || defined(__clang__)) && defined(__x86_64__)
+    __attribute__((target("popcnt")))
+        inline u64 count_words_hw(const u64* words, u32 wc) {
+        u64 c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+        u32 i = 0;
+        for (; i + 3 < wc; i += 4) {
+            c0 += static_cast<u64>(__builtin_popcountll(~words[i]));
+            c1 += static_cast<u64>(__builtin_popcountll(~words[i + 1]));
+            c2 += static_cast<u64>(__builtin_popcountll(~words[i + 2]));
+            c3 += static_cast<u64>(__builtin_popcountll(~words[i + 3]));
+        }
+        u64 sum = c0 + c1 + c2 + c3;
+        for (; i < wc; ++i) sum += static_cast<u64>(__builtin_popcountll(~words[i]));
+        return sum;
+    }
+    inline u64 count_words(const u64* words, u32 wc) {
+        static const bool supported = __builtin_cpu_supports("popcnt");
+        return supported ? count_words_hw(words, wc) : count_words_swar(words, wc);
+    }
+#else
+    inline u64 count_words(const u64* words, u32 wc) {
+        return count_words_swar(words, wc);
+    }
+#endif
+
+    // === ORIGINAL FORMULA 1: Modulo-6 candidate mapping ===
+    constexpr u64 candidate_count(u64 n) {
+        if (n < 5) return 0;
+        return (n - 5) / 6 + 1 + (n >= 7 ? (n - 7) / 6 + 1 : 0);
+    }
+    constexpr u64 candidate(u64 i) { return 3 * i + ((i & 1) ? 4 : 5); }
+
+    // Because word_idx is always a multiple of 64 (even):
+    //   candidate(word_idx + bit) == 3 * word_idx + candidate(bit)
+    static constexpr std::array<u16, 64> make_candidate_lut() {
+        std::array<u16, 64> a{};
+        for (u32 b = 0; b < 64; ++b) a[b] = static_cast<u16>(candidate(b));
+        return a;
+    }
+    static constexpr std::array<u16, 64> CANDIDATE_LUT = make_candidate_lut();
+
+    inline u64 integer_sqrt(u64 n) {
+        u64 r = static_cast<u64>(std::sqrt(static_cast<long double>(n)));
+        while (r && r > n / r) --r;
+        while (r < 0xffffffffULL && r + 1 <= n / (r + 1)) ++r;
+        return r;
+    }
+
+    // 16 tiled presieve patterns covering primes 5..163 (~221 KiB total, fits in L2).
+    // Every pattern is built strictly from Original Formulas 2 & 3.
+    struct PresievePattern {
+        u32 period;
+        std::vector<u8> data;
+    };
+
+    struct Presieve16 {
+        std::array<PresievePattern, 16> pats;
+        std::vector<u32> presieved_primes;
+
+        static PresievePattern make(std::initializer_list<u32> ps) {
+            u32 period = 1;
+            for (u32 p : ps) period *= p;
+            const u64 period_bits = static_cast<u64>(period) * 8ULL;
+            std::vector<u8> pat(period + PRESIEVE_TILE + 32u, 0);
+            for (u32 p32 : ps) {
+                const u64 p = p32;
+                const u64 step = 2 * p;
+                // === ORIGINAL FORMULA 2 ===
+                const u64 start1 = (p * p) / 3 - 1;
+                // === ORIGINAL FORMULA 3 ===
+                const u64 other = p + (p % 6 == 5 ? 2 : 4);
+                const u64 start2 = (p * other) / 3 - 1;
+
+                for (u64 off = start1 % step; off < period_bits; off += step)
+                    pat[static_cast<std::size_t>(off >> 3)] |= static_cast<u8>(1u << (off & 7));
+                for (u64 off = start2 % step; off < period_bits; off += step)
+                    pat[static_cast<std::size_t>(off >> 3)] |= static_cast<u8>(1u << (off & 7));
+            }
+            for (u32 i = 0; i < PRESIEVE_TILE + 32u; ++i)
+                pat[period + i] = pat[i % period];
+            return { period, std::move(pat) };
+        }
+
+        Presieve16()
+            : pats{ {
+                make({ 5, 7, 11, 13 }), //  5,005 B
+                make({ 17, 19, 23 }),   //  7,429 B
+                make({ 29, 31, 37 }),   // 33,263 B
+                make({ 41, 43 }),       //  1,763 B
+                make({ 47, 53 }),       //  2,491 B
+                make({ 59, 61 }),       //  3,599 B
+                make({ 67, 71 }),       //  4,757 B
+                make({ 73, 79 }),       //  5,767 B
+                make({ 83, 89 }),       //  7,387 B
+                make({ 97, 101 }),      //  9,797 B
+                make({ 103, 107 }),     // 11,021 B
+                make({ 109, 113 }),     // 12,317 B
+                make({ 127, 131 }),     // 16,637 B
+                make({ 137, 139 }),     // 19,043 B
+                make({ 149, 151 }),     // 22,499 B
+                make({ 157, 163 })      // 25,591 B
+              } },
+            presieved_primes{
+                5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71,
+                73, 79, 83, 89, 97, 101, 103, 107, 109, 113, 127, 131, 137, 139, 149, 151, 157, 163
+              } {}
+    };
+
+    static const Presieve16& get_presieve() {
+        static const Presieve16 patterns;
+        return patterns;
+    }
+
+    inline void fill_presieve(u8* __restrict sieve, u32 seg_bytes, u64 base_byte, const Presieve16& pre) {
+        for (u32 tb = 0; tb < seg_bytes; tb += PRESIEVE_TILE) {
+            const u32 chunk = std::min(PRESIEVE_TILE, seg_bytes - tb);
+            const u8* ptrs[16];
+            for (int k = 0; k < 16; ++k)
+                ptrs[k] = pre.pats[k].data.data() + ((base_byte + tb) % pre.pats[k].period);
+            u8* __restrict dst = sieve + tb;
+#if defined(__AVX2__)
+            const u32 aligned = (chunk + 31u) & ~31u;
+            for (u32 i = 0; i < aligned; i += 32u) {
+                __m256i v0 = _mm256_or_si256(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(ptrs[0] + i)),
+                    _mm256_loadu_si256(reinterpret_cast<const __m256i*>(ptrs[1] + i)));
+                __m256i v1 = _mm256_or_si256(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(ptrs[2] + i)),
+                    _mm256_loadu_si256(reinterpret_cast<const __m256i*>(ptrs[3] + i)));
+                __m256i v2 = _mm256_or_si256(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(ptrs[4] + i)),
+                    _mm256_loadu_si256(reinterpret_cast<const __m256i*>(ptrs[5] + i)));
+                __m256i v3 = _mm256_or_si256(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(ptrs[6] + i)),
+                    _mm256_loadu_si256(reinterpret_cast<const __m256i*>(ptrs[7] + i)));
+                __m256i v4 = _mm256_or_si256(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(ptrs[8] + i)),
+                    _mm256_loadu_si256(reinterpret_cast<const __m256i*>(ptrs[9] + i)));
+                __m256i v5 = _mm256_or_si256(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(ptrs[10] + i)),
+                    _mm256_loadu_si256(reinterpret_cast<const __m256i*>(ptrs[11] + i)));
+                __m256i v6 = _mm256_or_si256(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(ptrs[12] + i)),
+                    _mm256_loadu_si256(reinterpret_cast<const __m256i*>(ptrs[13] + i)));
+                __m256i v7 = _mm256_or_si256(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(ptrs[14] + i)),
+                    _mm256_loadu_si256(reinterpret_cast<const __m256i*>(ptrs[15] + i)));
+                __m256i r0 = _mm256_or_si256(_mm256_or_si256(v0, v1), _mm256_or_si256(v2, v3));
+                __m256i r1 = _mm256_or_si256(_mm256_or_si256(v4, v5), _mm256_or_si256(v6, v7));
+                _mm256_store_si256(reinterpret_cast<__m256i*>(dst + i), _mm256_or_si256(r0, r1));
+            }
+#else
+            const u32 aligned = (chunk + 7u) & ~7u;
+            for (u32 i = 0; i < aligned; ++i) {
+                const u8 a = (ptrs[0][i] | ptrs[1][i]) | (ptrs[2][i] | ptrs[3][i]);
+                const u8 b = (ptrs[4][i] | ptrs[5][i]) | (ptrs[6][i] | ptrs[7][i]);
+                const u8 c = (ptrs[8][i] | ptrs[9][i]) | (ptrs[10][i] | ptrs[11][i]);
+                const u8 d = (ptrs[12][i] | ptrs[13][i]) | (ptrs[14][i] | ptrs[15][i]);
+                dst[i] = (a | b) | (c | d);
+            }
+#endif
+        }
+    }
+
+    static std::vector<u32> base_primes(u64 n) {
+        const u64 limit = integer_sqrt(n);
+        if (limit < 167) return {};
+        std::vector<u8> composite(static_cast<std::size_t>(limit / 2 + 1), 0);
+        for (u64 p = 3; p <= limit / p; p += 2) {
+            if (composite[static_cast<std::size_t>(p >> 1)]) continue;
+            for (u64 m = p * p; m <= limit; m += 2 * p)
+                composite[static_cast<std::size_t>(m >> 1)] = 1;
+        }
+        std::vector<u32> primes;
+        const double est = static_cast<double>(limit) / std::max(1.0, std::log(static_cast<double>(limit)));
+        primes.reserve(static_cast<std::size_t>(est * 1.15));
+        for (u64 p = 167; p <= limit; p += 2)
+            if (!composite[static_cast<std::size_t>(p >> 1)])
+                primes.push_back(static_cast<u32>(p));
+        return primes;
+    }
+
+    // 64-byte aligned, uninitialized contiguous prime storage (required for AVX2 NT stores).
+    struct AlignedDeleter {
+        void operator()(u64* p) const noexcept {
+            if (p) ::operator delete[](p, std::align_val_t{ 64 });
+        }
+    };
+
+    struct PrimeBlock {
+        std::unique_ptr<u64[], AlignedDeleter> ptr;
+        std::size_t len = 0;
+        std::size_t cap = 0;
+
+        void allocate_uninitialized(std::size_t capacity) {
+            cap = capacity;
+            len = 0;
+            ptr.reset(capacity
+                ? static_cast<u64*>(::operator new[](capacity * sizeof(u64), std::align_val_t{ 64 }))
+                : nullptr);
+        }
+        void grow_to(std::size_t new_cap) {
+            std::unique_ptr<u64[], AlignedDeleter> next(
+                static_cast<u64*>(::operator new[](new_cap * sizeof(u64), std::align_val_t{ 64 })));
+            if (len) std::memcpy(next.get(), ptr.get(), len * sizeof(u64));
+            ptr = std::move(next);
+            cap = new_cap;
+        }
+        u64* data() { return ptr.get(); }
+        const u64* data() const { return ptr.get(); }
+        const u64* begin() const { return ptr.get(); }
+        const u64* end() const { return ptr.get() + len; }
+        std::size_t size() const { return len; }
+    };
+
+    struct Result {
+        u64 limit = 0;
+        u64 count = 0;
+        bool materialized = true;
+        // Ordered chunks of primes >= 5; never copied into a second vector.
+        std::vector<PrimeBlock> segments;
+    };
+
+    // Small prime (167..2048): 8 direct byte offsets (one per bit 0..7), constant stride p.
+    // Bits 1,3,5,7 come directly from Formula 2; bits 0,2,4,6 come directly from Formula 3.
+    struct LanePrime {
+        u32 p;
+        u32 off[8];
+    };
+
+    // Medium prime (2049..131071): flat switch-free progression (step = 2*p bits).
+    struct FlatProg {
+        u32 step;
+        u32 off;
+    };
+
+    // Large prime (>= 131072): bucketed hit (step = 2*p bits).
+    struct BucketHit {
+        u32 p;
+        u32 off;
+    };
+
+    static Result generate(u64 n, int threads = 0, bool materialize = true, bool use_nt_stores = true) {
+        static_assert(sizeof(std::size_t) >= 8, "PrimeLister requires a 64-bit build");
+        if (threads < 0) throw std::invalid_argument("Thread count must be >= 0");
+        if (!threads) threads = available_threads();
+#ifndef _OPENMP
+        threads = 1;
+#endif
+#ifndef __AVX2__
+        (void)use_nt_stores;
+#endif
+        Result result;
+        result.limit = n;
+        result.materialized = materialize;
+        result.count = (n >= 2) + (n >= 3);
+        const u64 length = candidate_count(n);
+        if (!length) return result;
+
+        const auto& pre = get_presieve();
+        const auto primes = base_primes(n);
+
+        const u64 total_segs = (length + SEG_BITS - 1ULL) >> SEG_BIT_SHIFT;
+        threads = static_cast<int>(std::min<u64>(static_cast<u64>(threads), total_segs));
+
+        u64 segs_per_chunk = std::max<u64>(1ULL, total_segs / (static_cast<u64>(threads) * 4ULL));
+        segs_per_chunk = std::min<u64>(segs_per_chunk, 256ULL);
+        const u64 num_chunks = (total_segs + segs_per_chunk - 1ULL) / segs_per_chunk;
+
+        // Pre-allocate 64-byte aligned chunk buffers outside the parallel region.
+        if (materialize) {
+            result.segments.resize(static_cast<std::size_t>(num_chunks));
+            for (u64 c = 0; c < num_chunks; ++c) {
+                const u64 seg_start = c * segs_per_chunk;
+                const u64 seg_cnt = std::min<u64>(segs_per_chunk, total_segs - seg_start);
+                const u64 low_idx = seg_start << SEG_BIT_SHIFT;
+                const u64 end_idx = std::min<u64>(length, (seg_start + seg_cnt) << SEG_BIT_SHIFT);
+                const u64 low_num = candidate(low_idx);
+                const u64 high_num = candidate(end_idx - 1ULL);
+                const u64 span = high_num - low_num + 1ULL;
+                const double denom = (low_num > 100000ULL)
+                    ? std::log(static_cast<double>(low_num))
+                    : std::log(static_cast<double>(std::max<u64>(span, 16ULL)));
+                u64 cap = (low_num > 100000ULL)
+                    ? static_cast<u64>(1.20 * static_cast<double>(span) / denom) + 4096ULL
+                    : static_cast<u64>(2.10 * static_cast<double>(span) / std::max(1.0, denom)) + 4096ULL;
+                cap = std::min<u64>(cap, end_idx - low_idx);
+                result.segments[static_cast<std::size_t>(c)].allocate_uninitialized(static_cast<std::size_t>(cap));
+            }
+        }
+
+        std::atomic<bool> failed{ false };
+        std::exception_ptr error;
+        u64 total = 0;
+
+#pragma omp parallel num_threads(threads) reduction(+:total)
+        {
+            alignas(64) u8 sieve[SEG_BYTES + 32u];
+#if defined(__AVX2__)
+            alignas(64) u64 stage[NT_STAGE_FLUSH + 64u];
+#endif
+            std::vector<LanePrime> lanes;
+            std::vector<FlatProg> med;
+            std::vector<std::vector<BucketHit>> buckets;
+
+#pragma omp for schedule(dynamic, 1)
+            for (long long c = 0; c < static_cast<long long>(num_chunks); ++c) {
+                if (failed.load(std::memory_order_relaxed)) continue;
+                try {
+                    const u64 seg_start = static_cast<u64>(c) * segs_per_chunk;
+                    const u64 seg_cnt = std::min<u64>(segs_per_chunk, total_segs - seg_start);
+                    const u64 chunk_base = seg_start << SEG_BIT_SHIFT;
+                    const u64 chunk_end = std::min<u64>(length, (seg_start + seg_cnt) << SEG_BIT_SHIFT);
+                    const u64 chunk_len = chunk_end - chunk_base;
+                    const u64 chunk_high = candidate(chunk_end - 1ULL);
+                    const u32 sentinel_byte = static_cast<u32>(((chunk_len + 7ULL) >> 3) + SEG_BYTES);
+
+                    lanes.clear();
+                    med.clear();
+                    if (buckets.size() < seg_cnt) buckets.resize(static_cast<std::size_t>(seg_cnt));
+                    for (u64 s = 0; s < seg_cnt; ++s) buckets[static_cast<std::size_t>(s)].clear();
+
+                    auto first_rel = [&](u64 start, u64 step) -> u64 {
+                        if (start >= chunk_end) return chunk_len;
+                        return start >= chunk_base
+                            ? (start - chunk_base)
+                            : (step - (chunk_base - start) % step) % step;
+                        };
+
+                    // Initialize all relevant primes >= 167 ONCE for this chunk using Formulas 2 & 3.
+                    for (u32 p32 : primes) {
+                        const u64 p = p32;
+                        const u64 square = p * p;
+                        if (square > chunk_high) break;
+                        const u64 step = 2 * p;
+
+                        // === ORIGINAL FORMULA 2 ===
+                        const u64 start1 = square / 3 - 1;
+                        // === ORIGINAL FORMULA 3 ===
+                        const u64 other = p + (p % 6 == 5 ? 2 : 4);
+                        const u64 start2 = (p <= chunk_high / other) ? ((p * other) / 3 - 1) : chunk_end;
+
+                        const u64 rel1 = first_rel(start1, step);
+                        const u64 rel2 = first_rel(start2, step);
+
+                        if (p32 <= LANE_P_LIMIT) {
+                            LanePrime lp;
+                            lp.p = p32;
+                            for (int b = 0; b < 8; ++b) lp.off[b] = sentinel_byte;
+                            if (rel1 < chunk_len) {
+                                u64 o = rel1;
+                                for (int i = 0; i < 4; ++i) {
+                                    if (o < chunk_len) lp.off[o & 7u] = static_cast<u32>(o >> 3);
+                                    o += step;
+                                }
+                            }
+                            if (rel2 < chunk_len) {
+                                u64 o = rel2;
+                                for (int i = 0; i < 4; ++i) {
+                                    if (o < chunk_len) lp.off[o & 7u] = static_cast<u32>(o >> 3);
+                                    o += step;
+                                }
+                            }
+                            lanes.push_back(lp);
+                        }
+                        else if (p32 < BUCKET_LIMIT) {
+                            if (rel1 < chunk_len) med.push_back({ static_cast<u32>(step), static_cast<u32>(rel1) });
+                            if (rel2 < chunk_len) med.push_back({ static_cast<u32>(step), static_cast<u32>(rel2) });
+                        }
+                        else {
+                            if (rel1 < chunk_len) {
+                                const u64 rs = rel1 >> SEG_BIT_SHIFT;
+                                if (rs < seg_cnt)
+                                    buckets[static_cast<std::size_t>(rs)].push_back({ p32, static_cast<u32>(rel1 & SEG_BIT_MASK) });
+                            }
+                            if (rel2 < chunk_len) {
+                                const u64 rs = rel2 >> SEG_BIT_SHIFT;
+                                if (rs < seg_cnt)
+                                    buckets[static_cast<std::size_t>(rs)].push_back({ p32, static_cast<u32>(rel2 & SEG_BIT_MASK) });
+                            }
+                        }
+                    }
+
+                    PrimeBlock* block = materialize ? &result.segments[static_cast<std::size_t>(c)] : nullptr;
+#if defined(__AVX2__)
+                    u64* stp = stage;
+                    auto flush_nt = [&](bool final_flush) {
+                        const std::size_t st_len = static_cast<std::size_t>(stp - stage);
+                        const std::size_t n_vec = st_len & ~std::size_t(3);
+                        if (n_vec) {
+                            if (block->len + n_vec > block->cap) {
+                                block->grow_to(std::max(block->len + n_vec, block->cap + (block->cap >> 2) + 4096u));
+                            }
+                            const __m256i* src = reinterpret_cast<const __m256i*>(stage);
+                            __m256i* dst = reinterpret_cast<__m256i*>(block->data() + block->len);
+                            for (std::size_t i = 0; i < (n_vec >> 2); ++i)
+                                _mm256_stream_si256(dst + i, _mm256_load_si256(src + i));
+                            block->len += n_vec;
+                            const std::size_t rem = st_len - n_vec;
+                            for (std::size_t i = 0; i < rem; ++i) stage[i] = stage[n_vec + i];
+                            stp = stage + rem;
+                        }
+                        if (final_flush && stp > stage) {
+                            const std::size_t rem = static_cast<std::size_t>(stp - stage);
+                            if (block->len + rem > block->cap) {
+                                block->grow_to(std::max(block->len + rem, block->cap + (block->cap >> 2) + 4096u));
+                            }
+                            u64* dst = block->data() + block->len;
+                            for (std::size_t i = 0; i < rem; ++i) dst[i] = stage[i];
+                            block->len += rem;
+                            stp = stage;
+                        }
+                        };
+#endif
+
+                    for (u64 s = 0; s < seg_cnt; ++s) {
+                        const u64 base = (seg_start + s) << SEG_BIT_SHIFT;
+                        const u32 size = static_cast<u32>(std::min<u64>(SEG_BITS, length - base));
+                        const u32 seg_bytes = (size + 7u) >> 3;
+                        const u64 base_byte = base >> 3;
+
+                        // 1. 16-pattern tiled AVX2 presieve (primes 5..163)
+                        fill_presieve(sieve, seg_bytes, base_byte, pre);
+
+                        // Restore the presieved primes themselves in segment 0
+                        if (base == 0) {
+                            for (u32 p : pre.presieved_primes) {
+                                const u32 idx = p / 3u - 1u;
+                                if (idx < size) sieve[idx >> 3] &= static_cast<u8>(~(1u << (idx & 7u)));
+                            }
+                        }
+
+                        // 2. Small primes (167..2048): switch-free 8-lane stride-p 4x unrolled
+                        u8* const end_ptr = sieve + seg_bytes;
+                        for (auto& lp : lanes) {
+                            const u32 p = lp.p;
+                            const u32 p2 = p * 2u;
+                            const u32 p3 = p * 3u;
+                            const u32 p4 = p * 4u;
+                            u8* const lim4 = (seg_bytes > p3) ? (end_ptr - p3) : sieve;
+                            auto mark_lane = [&](u32 b, u8 mask) {
+                                const u32 o = lp.off[b];
+                                if (o >= seg_bytes) { lp.off[b] = o - seg_bytes; return; }
+                                u8* ptr = sieve + o;
+                                while (ptr < lim4) {
+                                    ptr[0] |= mask;
+                                    ptr[p] |= mask;
+                                    ptr[p2] |= mask;
+                                    ptr[p3] |= mask;
+                                    ptr += p4;
+                                }
+                                while (ptr < end_ptr) {
+                                    *ptr |= mask;
+                                    ptr += p;
+                                }
+                                lp.off[b] = static_cast<u32>(ptr - end_ptr);
+                                };
+                            mark_lane(0, 0x01); mark_lane(1, 0x02); mark_lane(2, 0x04); mark_lane(3, 0x08);
+                            mark_lane(4, 0x10); mark_lane(5, 0x20); mark_lane(6, 0x40); mark_lane(7, 0x80);
+                        }
+
+                        // 3. Medium primes (2049..131071): switch-free flat 64-bit word marking
+                        u64* words_mut = reinterpret_cast<u64*>(sieve);
+                        for (auto& fp : med) {
+                            u32 off = fp.off;
+                            const u32 step = fp.step;
+                            while (off < size) {
+                                words_mut[off >> 6] |= (u64(1) << (off & 63u));
+                                off += step;
+                            }
+                            fp.off = off - size;
+                        }
+
+                        // 4. Large primes (>= 131072): bucket sieve
+                        auto& bkt = buckets[static_cast<std::size_t>(s)];
+                        for (const auto& h : bkt) {
+                            const u64 step = static_cast<u64>(h.p) * 2ULL;
+                            u64 off = h.off;
+                            while (off < size) {
+                                sieve[static_cast<std::size_t>(off >> 3)] |= static_cast<u8>(1u << (off & 7u));
+                                off += step;
+                            }
+                            const u64 next_seg = s + (off >> SEG_BIT_SHIFT);
+                            if (next_seg < seg_cnt)
+                                buckets[static_cast<std::size_t>(next_seg)].push_back({ h.p, static_cast<u32>(off & SEG_BIT_MASK) });
+                        }
+                        bkt.clear();
+
+                        // 5. Tail masking and 64-bit word padding
+                        if (size & 7u)
+                            sieve[seg_bytes - 1u] |= static_cast<u8>(~((1u << (size & 7u)) - 1u));
+                        const u32 wc = (seg_bytes + 7u) >> 3;
+                        const u32 padded_bytes = wc << 3;
+                        for (u32 b = seg_bytes; b < padded_bytes; ++b) sieve[b] = 0xFF;
+
+                        const u64* words = reinterpret_cast<const u64*>(sieve);
+
+                        if (!materialize) {
+                            total += count_words(words, wc);
+                        }
+#if defined(__AVX2__)
+                        else if (use_nt_stores) {
+                            u64 word_base = 3ULL * base;
+                            for (u32 wi = 0; wi < wc; ++wi, word_base += 192ULL) {
+                                u64 bits = ~words[wi];
+                                while (bits) {
+                                    *stp++ = word_base + CANDIDATE_LUT[trailing_zeros(bits)];
+                                    bits &= bits - 1ULL;
+                                }
+                                if (stp >= stage + NT_STAGE_FLUSH) flush_nt(false);
+                            }
+                        }
+#endif
+                        else {
+                            if (block->len + static_cast<std::size_t>(size) > block->cap) {
+                                const u64 exact_seg = count_words(words, wc);
+                                if (block->len + exact_seg > block->cap) {
+                                    const std::size_t needed = block->len + static_cast<std::size_t>(exact_seg);
+                                    block->grow_to(std::max(needed, block->cap + (block->cap >> 2) + 4096u));
+                                }
+                            }
+                            u64* outp = block->data() + block->len;
+                            u64* const seg_out_start = outp;
+                            u64 word_base = 3ULL * base;
+                            for (u32 wi = 0; wi < wc; ++wi, word_base += 192ULL) {
+                                u64 bits = ~words[wi];
+                                while (bits) {
+                                    *outp++ = word_base + CANDIDATE_LUT[trailing_zeros(bits)];
+                                    bits &= bits - 1ULL;
+                                }
+                            }
+                            const std::size_t written = static_cast<std::size_t>(outp - seg_out_start);
+                            block->len += written;
+                            total += written;
+                        }
+                    }
+
+#if defined(__AVX2__)
+                    if (materialize && use_nt_stores) {
+                        flush_nt(true);
+                        total += block->len;
+                    }
+#endif
+                }
+                catch (...) {
+                    failed.store(true, std::memory_order_relaxed);
+#pragma omp critical(primelister_error)
+                    { if (!error) error = std::current_exception(); }
+                }
+            }
+#if defined(__AVX2__)
+            if (materialize && use_nt_stores) _mm_sfence();
+#endif
+        }
+        if (error) std::rethrow_exception(error);
+        result.count += total;
+        return result;
+    }
+
+    static int calibrate_threads(u64 n, bool materialize, bool use_nt_stores) {
+#ifdef _OPENMP
+        omp_set_dynamic(0);
+#endif
+        const u64 test_n = std::min<u64>(n, 1000000000ULL);
+        const u64 length = candidate_count(test_n);
+        const u64 segments = length ? ((length + SEG_BITS - 1ULL) >> SEG_BIT_SHIFT) : 1ULL;
+        const int maximum = static_cast<int>(std::min<u64>(static_cast<u64>(available_threads()), segments));
+        if (maximum <= 1) {
+            std::cout << "Calibration skipped: only one thread is usable for this range or build.\n";
+            return 1;
+        }
+        std::vector<int> configs = { 1, maximum / 4, maximum / 2, (3 * maximum) / 4, maximum };
+        for (int& t : configs) t = std::max(1, t);
+        std::sort(configs.begin(), configs.end());
+        configs.erase(std::unique(configs.begin(), configs.end()), configs.end());
+        std::vector<std::vector<double>> samples(configs.size());
+        std::cout << "\nCalibration with N=" << test_n
+            << (materialize ? " (calculation + storage in RAM)" : " (counting only)")
+            << "\nPer thread count: 1 warm-up run + 3 timed runs; selection by median.\n" << std::flush;
+        bool have_count = false;
+        u64 expected_count = 0;
+        for (int round = -1; round < 3; ++round) {
+            for (std::size_t k = 0; k < configs.size(); ++k) {
+                const std::size_t which = (k + static_cast<std::size_t>(round + 1)) % configs.size();
+                const auto start = Clock::now();
+                auto result = generate(test_n, configs[which], materialize, use_nt_stores);
+                const double elapsed = seconds(start);
+                if (have_count && result.count != expected_count)
+                    throw std::runtime_error("Inconsistent prime counts during calibration");
+                expected_count = result.count;
+                have_count = true;
+                if (round >= 0) samples[which].push_back(elapsed);
+            }
+            std::cout << (round < 0 ? "  Warm-up completed.\n" : "  Measurement round completed.\n")
+                << std::flush;
+        }
+        int best = configs.front();
+        double best_seconds = std::numeric_limits<double>::max();
+        for (std::size_t k = 0; k < configs.size(); ++k) {
+            auto& values = samples[k];
+            std::sort(values.begin(), values.end());
+            const double median = values[1];
+            std::cout << "  Threads " << std::setw(3) << configs[k] << ": "
+                << std::fixed << std::setprecision(6) << median << " s (median)\n";
+            if (median < best_seconds) { best_seconds = median; best = configs[k]; }
+        }
+        std::cout << ">> Fastest tested setting: " << best << " threads\n";
+        if (test_n < n)
+            std::cout << "   Selected using calibration; the optimal thread count for the full N may differ.\n";
+        return best;
+    }
+
+    template<class F> static void for_each_prime(const Result& r, F f) {
+        if (!r.materialized) throw std::logic_error("Result contains only a count");
+        if (r.limit >= 2) f(u64(2));
+        if (r.limit >= 3) f(u64(3));
+        for (const auto& segment : r.segments)
+            for (u64 p : segment) f(p);
+    }
+
+    static void append_number(std::string& out, u64 n) {
+        static constexpr char DIGITS[201] =
+            "0001020304050607080910111213141516171819"
+            "2021222324252627282930313233343536373839"
+            "4041424344454647484950515253545556575859"
+            "6061626364656667686970717273747576777879"
+            "8081828384858687888990919293949596979899";
+        char buf[24];
+        char* p = buf + sizeof(buf);
+        while (n >= 100ULL) {
+            const u64 idx = (n % 100ULL) * 2ULL;
+            n /= 100ULL;
+            *--p = DIGITS[idx + 1];
+            *--p = DIGITS[idx];
+        }
+        if (n >= 10ULL) {
+            const u64 idx = n * 2ULL;
+            *--p = DIGITS[idx + 1];
+            *--p = DIGITS[idx];
+        }
+        else {
+            *--p = static_cast<char>('0' + n);
+        }
+        out.append(p, static_cast<std::size_t>((buf + sizeof(buf)) - p));
+    }
+
+    static void write_table(const Result& r, u64 cols, const std::string& path) {
+        if (!cols) throw std::invalid_argument("Columns must be >= 1");
+        if (!r.materialized) throw std::logic_error("Cannot write a count-only result");
+        std::ofstream file;
+        file.exceptions(std::ios::failbit | std::ios::badbit);
+        file.open(path, std::ios::out | std::ios::binary);
+        std::string buffer;
+        buffer.reserve(8 * 1024 * 1024 + 4096);
+        u64 index = 0, col = 0;
+        for_each_prime(r, [&](u64 p) {
+            if (!col) {
+                append_number(buffer, index + 1);
+                buffer.push_back('-');
+                append_number(buffer, index + std::min(cols, r.count - index));
+                buffer.push_back('\t');
+            }
+            append_number(buffer, p);
+            buffer.push_back('\t');
+            ++index;
+            if (++col == cols) { buffer.push_back('\n'); col = 0; }
+            if (buffer.size() >= 8 * 1024 * 1024) {
+                file.write(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+                buffer.clear();
+            }
+            });
+        if (col) buffer.push_back('\n');
+        if (!buffer.empty()) file.write(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+        file.close();
+    }
+
+    static void show_ends(const Result& r) {
+        std::vector<u64> first;
+        first.reserve(100);
+        if (r.limit >= 2) first.push_back(2);
+        if (r.limit >= 3) first.push_back(3);
+        for (const auto& seg : r.segments) {
+            if (first.size() >= 100) break;
+            const std::size_t take = std::min<std::size_t>(100 - first.size(), seg.size());
+            first.insert(first.end(), seg.begin(), seg.begin() + take);
+        }
+        std::vector<u64> last;
+        last.reserve(10);
+        for (auto s = r.segments.rbegin(); s != r.segments.rend() && last.size() < 10; ++s) {
+            const u64* d = s->data();
+            for (std::size_t i = s->size(); i > 0 && last.size() < 10; --i)
+                last.push_back(d[i - 1]);
+        }
+        if (last.size() < 10 && r.limit >= 3) last.push_back(3);
+        if (last.size() < 10 && r.limit >= 2) last.push_back(2);
+        std::reverse(last.begin(), last.end());
+
+        std::cout << "First up to 100 primes:\n";
+        for (u64 p : first) std::cout << p << ' ';
+        std::cout << "\nLast up to 10 primes:\n";
+        for (u64 p : last) std::cout << p << ' ';
+        std::cout << '\n';
+    }
+
+    static u64 parse_number(const std::string& text) {
+        u64 n = 0;
+        const auto r = std::from_chars(text.data(), text.data() + text.size(), n);
+        if (r.ec != std::errc() || r.ptr != text.data() + text.size())
+            throw std::invalid_argument("Invalid unsigned integer: " + text);
+        return n;
+    }
+} // namespace primelister
+
+#ifndef PRIMELISTER_NO_MAIN
+int main(int argc, char** argv) {
+    using namespace primelister;
+    std::ios::sync_with_stdio(false);
+    const bool interactive = argc == 1;
+    try {
+        u64 n = 0, cols = 10;
+        int threads = 0;
+        bool count_only = false, no_output = false, use_nt = true;
+        std::string output = "PrimeList.txt";
+        if (interactive) {
+            std::cout << "PrimeLister 3.3 (64-bit, Mod-6"
+#if defined(__AVX2__)
+                ", AVX2+NT"
+#endif
+                ")\nLimit N: " << std::flush;
+            std::string input;
+            if (!(std::cin >> input)) throw std::runtime_error("No limit supplied");
+            n = parse_number(input);
+            std::cout << "Columns (e.g. 10): " << std::flush;
+            if (!(std::cin >> input)) throw std::runtime_error("No column count supplied");
+            cols = parse_number(input);
+        }
+        else {
+            if (std::string(argv[1]) == "--help") {
+                std::cout << "PrimeLister_3_3 N [--cols C] [--threads T] [--output PATH]\n"
+                    "                [--no-output | --count] [--no-nt]\n"
+                    "N is inclusive. --no-output still materializes primes.\n"
+                    "--count counts only. --no-nt disables AVX2 non-temporal stores.\n"
+                    "T=0 (default) benchmarks thread counts first; T>0 skips calibration.\n";
+                return 0;
+            }
+            n = parse_number(argv[1]);
+            for (int i = 2; i < argc; ++i) {
+                const std::string arg = argv[i];
+                if (arg == "--count") { count_only = true; no_output = true; }
+                else if (arg == "--no-output") no_output = true;
+                else if (arg == "--no-nt") use_nt = false;
+                else if (arg == "--cols" || arg == "--threads" || arg == "--output") {
+                    if (++i == argc) throw std::invalid_argument("Missing value for " + arg);
+                    if (arg == "--output") output = argv[i];
+                    else if (arg == "--cols") cols = parse_number(argv[i]);
+                    else {
+                        const u64 t = parse_number(argv[i]);
+                        if (t > 1024) throw std::invalid_argument("Threads must be 0..1024");
+                        threads = static_cast<int>(t);
+                    }
+                }
+                else throw std::invalid_argument("Unknown option: " + arg);
+            }
+        }
+        if (!cols) throw std::invalid_argument("Columns must be >= 1");
+#ifdef _OPENMP
+        omp_set_dynamic(0);
+#endif
+        if (!threads) threads = calibrate_threads(n, !count_only, use_nt);
+#ifndef _OPENMP
+        threads = 1;
+        std::cout << "OpenMP disabled: single-threaded build.\n";
+#endif
+        const u64 length = candidate_count(n);
+        const u64 segment_count = length ? ((length + SEG_BITS - 1ULL) >> SEG_BIT_SHIFT) : 1ULL;
+        threads = static_cast<int>(std::min<u64>(static_cast<u64>(threads), segment_count));
+        std::cout << "\nMain calculation: N=" << n << ", threads=" << threads
+#if defined(__AVX2__)
+            << (count_only ? "" : (use_nt ? ", stores=AVX2-NT" : ", stores=standard"))
+#endif
+            << "\n" << std::flush;
+
+        const auto start = Clock::now();
+        auto result = generate(n, threads, !count_only, use_nt);
+        const double elapsed = seconds(start);
+
+        if (!count_only) show_ends(result);
+        const double rate = elapsed > 0 ? static_cast<double>(result.count) / elapsed : 0.0;
+        const auto report = [&]() {
+            std::cout << "\n========== Calculation results ==========\n"
+                << "Primes found: " << result.count << '\n'
+                << "Threads used: " << threads << '\n'
+                << std::fixed << std::setprecision(6)
+                << (count_only ? "Counting time [s]: " : "Calculation time [s]: ")
+                << elapsed << '\n'
+                << std::setprecision(0) << "Primes per second: " << rate << '\n'
+                << "Excludes calibration, console output and disk writing.\n";
+            if (!count_only) std::cout << "Calculation includes storing the primes in RAM.\n";
+            std::cout << std::flush;
+            };
+        report();
+        if (!no_output) {
+            std::cout << "\nWriting " << output << " ...\n" << std::flush;
+            write_table(result, cols, output);
+            std::cout << "File written: " << output << '\n';
+            report();
+        }
+        if (interactive) {
+            std::cout << "Done. Press Enter to exit..." << std::flush;
+            std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+            std::cin.get();
+        }
+        return 0;
+    }
+    catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << '\n';
+        if (interactive) {
+            std::cerr << "Press Enter to exit...";
+            std::cin.clear();
+            std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+            std::cin.get();
+        }
+        return 1;
+    }
+}
+#endif
